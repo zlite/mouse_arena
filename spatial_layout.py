@@ -292,6 +292,7 @@ class SpatialLayout:
         self.cage_right = self.cage_left + CAGE_WIDTH_CM * self.scale
         self.cage_bottom = self.cage_top + CAGE_HEIGHT_CM * self.scale
         self.config = self._read_config()
+        self.recording_enabled = bool(self.config.get("recording_enabled", True))
         self.positions = self._load()
         self.arena_corners = [list(point) for point in self.config.get(
             "arena_corners", DEFAULT_ARENA_CORNERS)]
@@ -315,6 +316,8 @@ class SpatialLayout:
                               pre_seconds, post_seconds, index * 0.35)
             for index, camera in enumerate(cameras)
         ]
+        for capture in self.captures:
+            capture.recorder.set_enabled(self.recording_enabled)
         self.closed = False
 
         root.title("Mouse arena — spatial motion dispatcher")
@@ -360,6 +363,13 @@ class SpatialLayout:
                   command=self._close_detail, fg="white", bg="#3c5365",
                   activeforeground="white", activebackground="#58758b",
                   padx=12, pady=5).pack(pady=8)
+        self.recording_button = tk.Button(
+            sidebar, command=self._toggle_recording,
+            fg="white", activeforeground="white", relief="raised", bd=2,
+            padx=12, pady=8, font=("TkDefaultFont", 11, "bold"),
+            cursor="hand2")
+        self.recording_button.pack(fill="x", padx=10, pady=(10, 2))
+        self._update_recording_button()
         self.dispatch_status = tk.Label(
             sidebar, text="Waiting for motion", fg="#ddd", bg="#171717",
             justify="left", anchor="w", padx=10, pady=10,
@@ -405,6 +415,7 @@ class SpatialLayout:
     def _save(self) -> None:
         payload = {"cage_cm": [70, 40], "fov_degrees": FOV_DEGREES,
                    "sentinel_bus": self.sentinel.bus,
+                   "recording_enabled": self.recording_enabled,
                    "positions": self.positions,
                    "arena_corners": self.arena_corners,
                    "motion_settings": {
@@ -413,6 +424,21 @@ class SpatialLayout:
                        "motion_frames": self.frames_value.get(),
                    }}
         self.layout_file.write_text(json.dumps(payload, indent=2) + "\n")
+
+    def _update_recording_button(self) -> None:
+        if self.recording_enabled:
+            self.recording_button.configure(
+                text="Recording: ON", bg="#8b1e1e", activebackground="#a52a2a")
+        else:
+            self.recording_button.configure(
+                text="Recording: OFF", bg="#444", activebackground="#555")
+
+    def _toggle_recording(self) -> None:
+        self.recording_enabled = not self.recording_enabled
+        for capture in self.captures:
+            capture.recorder.set_enabled(self.recording_enabled)
+        self._update_recording_button()
+        self._save()
 
     def _to_canvas(self, x: float, y: float) -> tuple[float, float]:
         return self.cage_left + x * self.scale, self.cage_top + y * self.scale
@@ -657,7 +683,8 @@ class SpatialLayout:
         self.active_cameras = self._coverage(points) if points else set()
         available = {index for index in self.active_cameras
                      if self.captures[index].online}
-        recording = bool(boxes) and len(available) >= 3
+        recording = (self.recording_enabled and bool(boxes)
+                     and len(available) >= 3)
         now = time.time()
         for index, capture in enumerate(self.captures):
             capture.update(recording and index in available, now)
@@ -668,7 +695,7 @@ class SpatialLayout:
             text=(f"Changed: {changed:.2f}%   Motion: "
                   f"{min(self.motion_frames, required)}/{required} frames\n"
                   f"FoV cameras: {selected or 'none'}\n"
-                  f"Recording: {'YES' if recording else 'no'}"
+                  f"Recording: {'DISABLED' if not self.recording_enabled else 'YES' if recording else 'armed'}"
                   f"{'   Offline: ' + ', '.join(offline) if offline else ''}"),
             fg="#ff7676" if recording else "#ddd")
         self._draw()

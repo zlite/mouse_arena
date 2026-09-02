@@ -5,6 +5,7 @@
   ],
   "fov_degrees": 50.0,
   "sentinel_bus": "usb-xhci-hcd.1-2.1",
+  "recording_enabled": false,
   "positions": {
     "usb-xhci-hcd.1-2.2": [
       36.916666666666664,
@@ -67,7 +68,7 @@
   ],
   "motion_settings": {
     "pixel_delta": 11,
-    "changed_percent": 1.0,
-    "motion_frames": 3
+    "changed_percent": 0.5,
+    "motion_frames": 2
   }
 }
