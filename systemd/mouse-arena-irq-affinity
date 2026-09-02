@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+assign_irq() {
+    pattern=$1
+    cpu=$2
+    irq=$(awk -v pattern="$pattern" '$0 ~ pattern {gsub(":", "", $1); print $1; exit}' /proc/interrupts)
+    if [ -n "$irq" ] && [ -w "/proc/irq/$irq/smp_affinity_list" ]; then
+        echo "$cpu" > "/proc/irq/$irq/smp_affinity_list"
+    fi
+}
+
+# Keep camera USB interrupt work away from CPU 0, where the desktop and input
+# stack tend to run. These patterns survive IRQ-number changes across boots.
+assign_irq 'MIP-MSI.*xhci_hcd' 1
+assign_irq 'xhci-hcd:usb3' 2
+assign_irq 'xhci-hcd:usb5' 3

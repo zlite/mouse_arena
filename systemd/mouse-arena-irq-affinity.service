@@ -1,0 +1,11 @@
+[Unit]
+Description=Distribute mouse-arena USB camera interrupts across CPU cores
+After=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mouse-arena-irq-affinity
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
