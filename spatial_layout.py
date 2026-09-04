@@ -35,6 +35,50 @@ DEFAULT_ARENA_CORNERS = ((136.5, 86.6), (360.0, 86.6),
                          (363.0, 231.8), (135.0, 230.6))
 
 
+def clip_polygon_to_rectangle(
+        points: list[tuple[float, float]], left: float, top: float,
+        right: float, bottom: float) -> list[tuple[float, float]]:
+    """Clip a polygon to an axis-aligned rectangle."""
+    def clip(edge: str, value: float,
+             polygon: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        if not polygon:
+            return []
+
+        def inside(point: tuple[float, float]) -> bool:
+            x, y = point
+            return (x >= value if edge == "left" else
+                    x <= value if edge == "right" else
+                    y >= value if edge == "top" else y <= value)
+
+        def intersection(start: tuple[float, float],
+                         end: tuple[float, float]) -> tuple[float, float]:
+            sx, sy = start
+            ex, ey = end
+            if edge in ("left", "right"):
+                ratio = (value - sx) / (ex - sx)
+                return value, sy + ratio * (ey - sy)
+            ratio = (value - sy) / (ey - sy)
+            return sx + ratio * (ex - sx), value
+
+        result: list[tuple[float, float]] = []
+        previous = polygon[-1]
+        for current in polygon:
+            if inside(current):
+                if not inside(previous):
+                    result.append(intersection(previous, current))
+                result.append(current)
+            elif inside(previous):
+                result.append(intersection(previous, current))
+            previous = current
+        return result
+
+    result = points
+    for edge, value in (("left", left), ("right", right),
+                        ("top", top), ("bottom", bottom)):
+        result = clip(edge, value, result)
+    return result
+
+
 def expand_corners(corners: list[list[float]],
                    scale: float = ARENA_MARGIN_SCALE) -> list[list[float]]:
     """Expand a calibration quadrilateral about its centroid."""
@@ -295,6 +339,11 @@ class SpatialLayout:
         self.config = self._read_config()
         self.recording_enabled = bool(self.config.get("recording_enabled", True))
         self.sentinel_flipped = bool(self.config.get("sentinel_flipped", False))
+        saved_flips = self.config.get("camera_flips", {})
+        self.camera_flips = {
+            camera.bus: bool(saved_flips.get(camera.bus, False))
+            for camera in cameras
+        }
         self.positions = self._load()
         self.arena_corners = [list(point) for point in self.config.get(
             "arena_corners", DEFAULT_ARENA_CORNERS)]
@@ -336,17 +385,28 @@ class SpatialLayout:
         sidebar = tk.Frame(body, width=500, bg="#202020")
         sidebar.pack(side="right", fill="y", padx=(0, 8), pady=8)
         sidebar.pack_propagate(False)
-        tk.Label(sidebar, text="OVERHEAD SENTINEL", fg="#86d7ff", bg="#202020",
-                 font=("TkDefaultFont", 12, "bold")).pack(pady=(10, 4))
-        self.sentinel_label = tk.Label(sidebar, text="connecting…", fg="#aaa",
+        self.preview_title = tk.Label(
+            sidebar, text="OVERHEAD SENTINEL", fg="#86d7ff", bg="#202020",
+            font=("TkDefaultFont", 12, "bold"))
+        self.preview_title.pack(pady=(10, 4))
+        preview_frame = tk.Frame(sidebar, width=480, height=270, bg="#111")
+        preview_frame.pack(padx=10)
+        preview_frame.pack_propagate(False)
+        self.sentinel_label = tk.Label(preview_frame, text="connecting…", fg="#aaa",
                                        bg="#111", width=480, height=270)
-        self.sentinel_label.pack(padx=10)
+        self.sentinel_label.pack(fill="both", expand=True)
         self.flip_button = tk.Button(
-            sidebar, command=self._toggle_sentinel_flip,
+            preview_frame, command=self._toggle_preview_flip,
             fg="white", bg="#3c5365", activeforeground="white",
-            activebackground="#58758b", padx=8, pady=3, cursor="hand2")
-        self.flip_button.pack(anchor="e", padx=10, pady=(4, 0))
+            activebackground="#58758b", padx=5, pady=2, bd=1,
+            cursor="hand2")
+        self.flip_button.place(relx=1.0, x=-6, y=6, anchor="ne")
         self._update_flip_button()
+        self.back_button = tk.Button(
+            sidebar, text="← Back to motion controls",
+            command=self._close_detail, fg="white", bg="#3c5365",
+            activeforeground="white", activebackground="#58758b",
+            padx=12, pady=5)
         self.motion_controls = tk.LabelFrame(
             sidebar, text=" Motion detection ", fg="white",
             bg="#202020", bd=1, padx=8, pady=6,
@@ -359,18 +419,6 @@ class SpatialLayout:
         self._scale(self.motion_controls, "Pixel delta", self.threshold_value, 1, 100, 1)
         self._scale(self.motion_controls, "Changed area %", self.percent_value, 0.1, 15, 0.1)
         self._scale(self.motion_controls, "Motion frames", self.frames_value, 1, 15, 1)
-        self.detail_panel = tk.Frame(sidebar, bg="#202020")
-        self.detail_title = tk.Label(self.detail_panel, text="", fg="white",
-                                     bg="#202020",
-                                     font=("TkDefaultFont", 11, "bold"))
-        self.detail_title.pack(pady=(8, 4))
-        self.detail_label = tk.Label(self.detail_panel, text="connecting…",
-                                     fg="#aaa", bg="#111")
-        self.detail_label.pack()
-        tk.Button(self.detail_panel, text="← Back to motion controls",
-                  command=self._close_detail, fg="white", bg="#3c5365",
-                  activeforeground="white", activebackground="#58758b",
-                  padx=12, pady=5).pack(pady=8)
         self.recording_button = tk.Button(
             sidebar, command=self._toggle_recording,
             fg="white", activeforeground="white", relief="raised", bd=2,
@@ -424,6 +472,7 @@ class SpatialLayout:
         payload = {"cage_cm": [70, 40], "fov_degrees": FOV_DEGREES,
                    "sentinel_bus": self.sentinel.bus,
                    "sentinel_flipped": self.sentinel_flipped,
+                   "camera_flips": self.camera_flips,
                    "recording_enabled": self.recording_enabled,
                    "positions": self.positions,
                    "arena_corners": self.arena_corners,
@@ -434,18 +483,24 @@ class SpatialLayout:
                    }}
         self.layout_file.write_text(json.dumps(payload, indent=2) + "\n")
 
-    def _toggle_sentinel_flip(self) -> None:
-        self.sentinel_flipped = not self.sentinel_flipped
-        self.motion_detector.previous = None
-        self.motion_history.clear()
-        self.last_confirmed_boxes.clear()
-        self.box_hold_until = 0.0
+    def _toggle_preview_flip(self) -> None:
+        if self.selected is None:
+            self.sentinel_flipped = not self.sentinel_flipped
+            self.motion_detector.previous = None
+            self.motion_history.clear()
+            self.last_confirmed_boxes.clear()
+            self.box_hold_until = 0.0
+        else:
+            bus = self.cameras[self.selected].bus
+            self.camera_flips[bus] = not self.camera_flips[bus]
         self._update_flip_button()
         self._save()
 
     def _update_flip_button(self) -> None:
-        state = "ON" if self.sentinel_flipped else "OFF"
-        self.flip_button.configure(text=f"↻ 180°  {state}")
+        flipped = (self.sentinel_flipped if self.selected is None else
+                   self.camera_flips[self.cameras[self.selected].bus])
+        self.flip_button.configure(
+            text="↻ 180°", bg="#8b5a2b" if flipped else "#3c5365")
 
     def _update_recording_button(self) -> None:
         if self.recording_enabled:
@@ -513,12 +568,15 @@ class SpatialLayout:
             # 70 cm cage. Convert axial depth to ray length for drawing.
             length_cm = ((CAGE_WIDTH_CM / 2) / math.cos(half)
                          if is_end_camera else 62)
-            length = length_cm * self.scale
             ox, oy = self._to_canvas(x, y)
-            points: list[float] = [ox, oy]
+            cone = [(x, y)]
             for ray in (direction - half, direction + half):
-                points.extend((ox + math.cos(ray) * length,
-                               oy + math.sin(ray) * length))
+                cone.append((x + math.cos(ray) * length_cm,
+                             y + math.sin(ray) * length_cm))
+            clipped = clip_polygon_to_rectangle(
+                cone, 0.0, 0.0, CAGE_WIDTH_CM, CAGE_HEIGHT_CM)
+            points = [coordinate for point in clipped
+                      for coordinate in self._to_canvas(*point)]
             self.canvas.create_polygon(points, fill="#547c69" if covered else "#344940",
                                        outline="#77aa91", stipple="gray50")
         for x, y, width, height in self.motion_boxes:
@@ -541,7 +599,6 @@ class SpatialLayout:
             self.canvas.create_text(ox, oy, text=str(index + 1), fill="white",
                                     font=("TkDefaultFont", 11, "bold"),
                                     tags=("camera", f"cam{index}"))
-        self.canvas.tag_bind("camera", "<Button-1>", self._camera_tag_press)
         if self.test_point:
             self.status.configure(text="Dispatcher selection: " +
                                   (", ".join(f"Camera {n + 1}" for n in sorted(active))
@@ -554,20 +611,13 @@ class SpatialLayout:
                 return index
         return None
 
-    def _camera_tag_press(self, event: tk.Event[Any]) -> str:
-        current = self.canvas.find_withtag("current")
-        if current:
-            for tag in self.canvas.gettags(current[0]):
-                if tag.startswith("cam") and tag[3:].isdigit():
-                    index = int(tag[3:])
-                    self.dragging = index
-                    self._select(index)
-                    return "break"
-        return ""
-
     def _press(self, event: tk.Event[Any]) -> None:
         index = self._camera_at(event.x, event.y)
         if index is not None:
+            if self.selected == index:
+                self.dragging = None
+                self._close_detail()
+                return
             self.dragging = index
             self._select(index)
             return
@@ -594,11 +644,12 @@ class SpatialLayout:
             return
         self._close_detail(redraw=False)
         self.selected = index
-        self.detail_title.configure(text=f"CAMERA {index + 1}")
-        self.detail_label.configure(image="", text="loading buffered preview…")
+        self.preview_title.configure(text=f"CAMERA {index + 1}")
+        self.sentinel_label.configure(image="", text="loading buffered preview…")
+        self._update_flip_button()
         self.detail_image = None
         self.motion_controls.pack_forget()
-        self.detail_panel.pack(fill="x", padx=10, pady=(14, 4))
+        self.back_button.pack(fill="x", padx=10, pady=(4, 0))
         self.detail_stream = BufferedPreview(
             self.captures[index].recorder.rolling, 480, 270)
         self.detail_stream.start()
@@ -613,8 +664,12 @@ class SpatialLayout:
             stream.close()
         self.selected = None
         self.detail_image = None
-        if hasattr(self, "detail_panel"):
-            self.detail_panel.pack_forget()
+        if hasattr(self, "preview_title"):
+            self.preview_title.configure(text="OVERHEAD SENTINEL")
+            self.sentinel_label.configure(image="", text="connecting…")
+            self._update_flip_button()
+        if hasattr(self, "back_button"):
+            self.back_button.pack_forget()
             self.motion_controls.pack(fill="x", padx=10, pady=(14, 4),
                                       before=self.dispatch_status)
         if redraw:
@@ -755,14 +810,20 @@ class SpatialLayout:
                 ).reshape(270, 480, 3)[::-1, ::-1].tobytes()
             frame = self._process_motion(frame)
             self.sentinel_image = self._photo(frame, 480, 270)
-            self.sentinel_label.configure(image=self.sentinel_image, text="")
+            if self.selected is None:
+                self.sentinel_label.configure(image=self.sentinel_image, text="")
         except queue.Empty:
             pass
         if self.detail_stream:
             try:
                 frame = self.detail_stream.frames.get_nowait()
+                assert self.selected is not None
+                if self.camera_flips[self.cameras[self.selected].bus]:
+                    frame = self.motion_detector.np.frombuffer(
+                        frame, dtype=self.motion_detector.np.uint8
+                    ).reshape(270, 480, 3)[::-1, ::-1].tobytes()
                 self.detail_image = self._photo(frame, 480, 270)
-                self.detail_label.configure(image=self.detail_image, text="")
+                self.sentinel_label.configure(image=self.detail_image, text="")
             except queue.Empty:
                 pass
         if not self.closed:

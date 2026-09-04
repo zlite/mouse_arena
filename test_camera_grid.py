@@ -8,8 +8,8 @@ from types import SimpleNamespace
 from camera_grid import (Camera, EventRecorder, MotionCoordinator, MotionDetector,
                          controller_name, deduplicate, device_sort_key, parse_camera,
                          root_port_name, stream_overlay_text, video_filter)
-from spatial_layout import (expand_corners, map_pixel_to_arena, point_in_fov,
-                            snap_to_cage)
+from spatial_layout import (clip_polygon_to_rectangle, expand_corners,
+                            map_pixel_to_arena, point_in_fov, snap_to_cage)
 
 
 class CameraTests(unittest.TestCase):
@@ -33,6 +33,13 @@ class CameraTests(unittest.TestCase):
         expanded = expand_corners([[0, 0], [10, 0], [10, 10], [0, 10]], 1.1)
         self.assertEqual(expanded, [[-0.5, -0.5], [10.5, -0.5],
                                     [10.5, 10.5], [-0.5, 10.5]])
+
+    def test_fov_polygon_is_clipped_to_arena(self):
+        polygon = [(35, 0), (90, 60), (-20, 60)]
+        clipped = clip_polygon_to_rectangle(polygon, 0, 0, 70, 40)
+        self.assertGreaterEqual(len(clipped), 3)
+        self.assertTrue(all(0 <= x <= 70 and 0 <= y <= 40
+                            for x, y in clipped))
 
     def test_parse_h264_camera(self):
         details = "Card type : USB Camera\nBus info : usb-0000:00:14.0-2"
