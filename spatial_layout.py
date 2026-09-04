@@ -29,8 +29,8 @@ DEFAULT_LAYOUT = (
     (0.0, 13.33), (0.0, 26.67),
     (70.0, 13.33), (70.0, 26.67),
 )
-# Inner wall corners measured from the overhead camera's exact 320x240 mode,
-# then scaled to the 480x270 UI preview: top-left clockwise to bottom-left.
+# Inner wall corners in the 480x270 overhead preview: top-left clockwise to
+# bottom-left.
 DEFAULT_ARENA_CORNERS = ((136.5, 86.6), (360.0, 86.6),
                          (363.0, 231.8), (135.0, 230.6))
 
@@ -118,11 +118,12 @@ class MjpegPreview:
         size = self.width * self.height * 3
         command = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
-            # This sentinel does not expose 640x360. Its 640x480 MJPEG mode
-            # reserves excessive isochronous bandwidth on the shared root port.
-            "-f", "v4l2", "-input_format", "yuyv422", "-framerate", "30",
-            "-video_size", "320x240", "-i", self.device, "-an",
-            "-vf", f"fps=5,scale={self.width}:{self.height}:flags=fast_bilinear",
+            "-fflags", "nobuffer", "-flags", "low_delay",
+            # Keep the night-vision sentinel at its full compressed frame rate;
+            # only scale the decoded image for the UI and motion analysis.
+            "-f", "v4l2", "-input_format", "mjpeg", "-framerate", "30",
+            "-video_size", "1920x1080", "-i", self.device, "-an",
+            "-vf", f"scale={self.width}:{self.height}:flags=fast_bilinear",
             "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1",
         ]
         self.process = subprocess.Popen(command, stdout=subprocess.PIPE,
@@ -293,6 +294,7 @@ class SpatialLayout:
         self.cage_bottom = self.cage_top + CAGE_HEIGHT_CM * self.scale
         self.config = self._read_config()
         self.recording_enabled = bool(self.config.get("recording_enabled", True))
+        self.sentinel_flipped = bool(self.config.get("sentinel_flipped", False))
         self.positions = self._load()
         self.arena_corners = [list(point) for point in self.config.get(
             "arena_corners", DEFAULT_ARENA_CORNERS)]
@@ -339,6 +341,12 @@ class SpatialLayout:
         self.sentinel_label = tk.Label(sidebar, text="connecting…", fg="#aaa",
                                        bg="#111", width=480, height=270)
         self.sentinel_label.pack(padx=10)
+        self.flip_button = tk.Button(
+            sidebar, command=self._toggle_sentinel_flip,
+            fg="white", bg="#3c5365", activeforeground="white",
+            activebackground="#58758b", padx=8, pady=3, cursor="hand2")
+        self.flip_button.pack(anchor="e", padx=10, pady=(4, 0))
+        self._update_flip_button()
         self.motion_controls = tk.LabelFrame(
             sidebar, text=" Motion detection ", fg="white",
             bg="#202020", bd=1, padx=8, pady=6,
@@ -415,6 +423,7 @@ class SpatialLayout:
     def _save(self) -> None:
         payload = {"cage_cm": [70, 40], "fov_degrees": FOV_DEGREES,
                    "sentinel_bus": self.sentinel.bus,
+                   "sentinel_flipped": self.sentinel_flipped,
                    "recording_enabled": self.recording_enabled,
                    "positions": self.positions,
                    "arena_corners": self.arena_corners,
@@ -424,6 +433,19 @@ class SpatialLayout:
                        "motion_frames": self.frames_value.get(),
                    }}
         self.layout_file.write_text(json.dumps(payload, indent=2) + "\n")
+
+    def _toggle_sentinel_flip(self) -> None:
+        self.sentinel_flipped = not self.sentinel_flipped
+        self.motion_detector.previous = None
+        self.motion_history.clear()
+        self.last_confirmed_boxes.clear()
+        self.box_hold_until = 0.0
+        self._update_flip_button()
+        self._save()
+
+    def _update_flip_button(self) -> None:
+        state = "ON" if self.sentinel_flipped else "OFF"
+        self.flip_button.configure(text=f"↻ 180°  {state}")
 
     def _update_recording_button(self) -> None:
         if self.recording_enabled:
@@ -727,6 +749,10 @@ class SpatialLayout:
     def _refresh(self) -> None:
         try:
             frame = self.sentinel_stream.frames.get_nowait()
+            if self.sentinel_flipped:
+                frame = self.motion_detector.np.frombuffer(
+                    frame, dtype=self.motion_detector.np.uint8
+                ).reshape(270, 480, 3)[::-1, ::-1].tobytes()
             frame = self._process_motion(frame)
             self.sentinel_image = self._photo(frame, 480, 270)
             self.sentinel_label.configure(image=self.sentinel_image, text="")
