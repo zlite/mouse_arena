@@ -1,0 +1,57 @@
+{
+  "cage_cm": [
+    70,
+    40
+  ],
+  "fov_degrees": 140.0,
+  "sentinel_bus": "usb-xhci-hcd.0-1",
+  "sentinel_flipped": false,
+  "camera_flips": {
+    "usb-xhci-hcd.0-2": false,
+    "usb-0001:04:00.0-1.2.3": false,
+    "usb-0001:04:00.0-1.2.4": false,
+    "usb-xhci-hcd.1-2.4.3": false
+  },
+  "recording_enabled": false,
+  "positions": {
+    "usb-xhci-hcd.0-2": [
+      36.083333333333336,
+      40.0
+    ],
+    "usb-0001:04:00.0-1.2.3": [
+      35.333333333333336,
+      0.0
+    ],
+    "usb-0001:04:00.0-1.2.4": [
+      0.0,
+      20.0
+    ],
+    "usb-xhci-hcd.1-2.4.3": [
+      70.0,
+      20.0
+    ]
+  },
+  "arena_corners": [
+    [
+      67.0,
+      26.0
+    ],
+    [
+      410.0,
+      26.0
+    ],
+    [
+      415.0,
+      240.0
+    ],
+    [
+      68.0,
+      240.0
+    ]
+  ],
+  "motion_settings": {
+    "pixel_delta": 5,
+    "changed_percent": 0.3,
+    "motion_frames": 3
+  }
+}

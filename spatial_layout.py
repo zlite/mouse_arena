@@ -17,22 +17,18 @@ import tkinter as tk
 from typing import Any
 
 from camera_grid import Camera, EventRecorder, MotionDetector, discover
+from uvc_timestamps import TimestampSession
 
 
 CAGE_WIDTH_CM = 70.0
 CAGE_HEIGHT_CM = 40.0
-FOV_DEGREES = 50.0
+FOV_DEGREES = 140.0
 ARENA_MARGIN_SCALE = 1.10
-DEFAULT_LAYOUT = (
-    (17.5, 0.0), (35.0, 0.0), (52.5, 0.0),
-    (17.5, 40.0), (35.0, 40.0), (52.5, 40.0),
-    (0.0, 13.33), (0.0, 26.67),
-    (70.0, 13.33), (70.0, 26.67),
-)
+DEFAULT_LAYOUT = ((35.0, 0.0), (35.0, 40.0), (0.0, 20.0), (70.0, 20.0))
 # Inner wall corners in the 480x270 overhead preview: top-left clockwise to
 # bottom-left.
-DEFAULT_ARENA_CORNERS = ((136.5, 86.6), (360.0, 86.6),
-                         (363.0, 231.8), (135.0, 230.6))
+DEFAULT_ARENA_CORNERS = ((90.0, 35.0), (400.0, 35.0),
+                         (405.0, 235.0), (70.0, 235.0))
 
 
 def clip_polygon_to_rectangle(
@@ -153,6 +149,9 @@ class MjpegPreview:
         self.stop = threading.Event()
         self.paused = threading.Event()
         self.process: subprocess.Popen[bytes] | None = None
+        self.measured_fps = 0.0
+        self._frame_count = 0
+        self._fps_started = time.monotonic()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -161,12 +160,13 @@ class MjpegPreview:
     def _run(self) -> None:
         size = self.width * self.height * 3
         command = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-filter_threads", "1",
             "-fflags", "nobuffer", "-flags", "low_delay",
-            # Keep the night-vision sentinel at its full compressed frame rate;
+            # Capture the USB 3 Sentinel at 60 FPS;
             # only scale the decoded image for the UI and motion analysis.
-            "-f", "v4l2", "-input_format", "mjpeg", "-framerate", "30",
-            "-video_size", "1920x1080", "-i", self.device, "-an",
+            "-threads", "2", "-lowres", "2",
+            "-f", "v4l2", "-input_format", "mjpeg", "-framerate", "60",
+            "-video_size", "1920x1200", "-i", self.device, "-an",
             "-vf", f"scale={self.width}:{self.height}:flags=fast_bilinear",
             "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1",
         ]
@@ -185,6 +185,13 @@ class MjpegPreview:
             except queue.Empty:
                 pass
             self.frames.put_nowait(frame)
+            self._frame_count += 1
+            now = time.monotonic()
+            elapsed = now - self._fps_started
+            if elapsed >= 1.0:
+                self.measured_fps = self._frame_count / elapsed
+                self._frame_count = 0
+                self._fps_started = now
 
     def close(self) -> None:
         self.stop.set()
@@ -213,8 +220,11 @@ class BufferedPreview:
         last: Path | None = None
         frame_size = self.width * self.height * 3
         while not self.stop.is_set():
-            segments = sorted(path for path in self.directory.glob("*.ts")
-                              if path.stat().st_size > 0)
+            try:
+                segments = sorted(path for path in self.directory.glob("*.mkv")
+                                  if path.stat().st_size > 0)
+            except FileNotFoundError:
+                continue  # Recording may move a completed segment to the SSD.
             # The newest file may still be written by the capture process.
             segment = segments[-2] if len(segments) >= 2 else None
             if segment is None or segment == last:
@@ -222,7 +232,8 @@ class BufferedPreview:
                 continue
             last = segment
             command = [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-filter_threads", "1",
+                "-threads", "1", "-lowres", "2", "-re",
                 "-i", str(segment), "-an", "-vf",
                 f"fps=5,scale={self.width}:{self.height}:flags=fast_bilinear",
                 "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1",
@@ -257,7 +268,7 @@ class BufferedPreview:
 
 
 class CompressedCapture:
-    """Continuously buffer one camera's untouched 1080p H.264 stream."""
+    """Continuously buffer one camera's untouched 1080p MJPEG stream."""
 
     def __init__(self, camera: Camera, number: int, event_dir: Path,
                  buffer_dir: Path, pre_seconds: float, post_seconds: float,
@@ -265,38 +276,57 @@ class CompressedCapture:
         self.camera, self.number = camera, number
         self.startup_delay = startup_delay
         self.recorder = EventRecorder(event_dir, buffer_dir, number,
-                                      pre_seconds, post_seconds)
+                                      pre_seconds, post_seconds, extension="mkv")
+        self.frames: queue.Queue[bytes] = queue.Queue(maxsize=1)
         self.stop = threading.Event()
         self.process: subprocess.Popen[bytes] | None = None
         self.thread = threading.Thread(target=self._run, daemon=True)
+        self.record_request = (False, time.time())
+        self.recorder_thread = threading.Thread(target=self._record_loop, daemon=True)
 
     def start(self) -> None:
         self.thread.start()
+        self.recorder_thread.start()
 
     def _run(self) -> None:
         if self.stop.wait(self.startup_delay):
             return
         while not self.stop.is_set():
             command = [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
-                "-f", "v4l2", "-input_format", "h264", "-framerate", "30",
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-filter_threads", "1",
+                "-copyts", "-threads", "1", "-lowres", "2",
+                "-f", "v4l2", "-timestamps", "abs", "-input_format", "mjpeg", "-framerate", "30",
                 "-video_size", "1920x1080", "-i", self.camera.device, "-an",
                 "-map", "0:v:0", "-c:v", "copy", "-f", "segment",
                 "-segment_time", "1", "-segment_atclocktime", "1",
-                "-reset_timestamps", "1", "-strftime", "1",
+                "-reset_timestamps", "0", "-avoid_negative_ts", "disabled", "-strftime", "1",
                 self.recorder.segment_pattern,
+                "-map", "0:v:0", "-vf",
+                "setpts=PTS-STARTPTS,fps=10,scale=144:81:flags=fast_bilinear",
+                "-threads", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1",
             ]
-            self.process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
-                                            stderr=subprocess.DEVNULL)
-            while not self.stop.wait(0.25):
-                process = self.process
-                if process is None or process.poll() is not None:
+            self.process = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                            stderr=subprocess.DEVNULL, bufsize=144 * 81 * 3)
+            assert self.process.stdout is not None
+            while not self.stop.is_set():
+                frame = self.process.stdout.read(144 * 81 * 3)
+                if len(frame) != 144 * 81 * 3:
                     break
+                try:
+                    self.frames.get_nowait()
+                except queue.Empty:
+                    pass
+                self.frames.put_nowait(frame)
             self._terminate()
             self.stop.wait(2)
 
     def update(self, active: bool, now: float) -> None:
-        self.recorder.update(active, now)
+        self.record_request = (active, now)
+
+    def _record_loop(self) -> None:
+        while not self.stop.wait(0.1):
+            active, now = self.record_request
+            self.recorder.update(active, now)
 
     def pause(self) -> None:
         self.paused.set()
@@ -323,6 +353,7 @@ class CompressedCapture:
         self.stop.set()
         self._terminate()
         self.thread.join(timeout=2)
+        self.recorder_thread.join()
         self.recorder.close()
 
 
@@ -355,6 +386,11 @@ class SpatialLayout:
         self.sentinel_stream = MjpegPreview(stable_index0(sentinel.device))
         self.sentinel_image: tk.PhotoImage | None = None
         self.motion_detector = MotionDetector(480, 270, 20, 1.0)
+        self.motion_detector.cv2.setNumThreads(1)
+        self.cv_fps = 0.0
+        self.cv_count = 0
+        self.cv_started = time.monotonic()
+        self.last_render = 0.0
         self.motion_frames = 0
         self.motion_history: deque[bool] = deque(maxlen=30)
         self.box_hold_until = 0.0
@@ -369,6 +405,9 @@ class SpatialLayout:
         ]
         for capture in self.captures:
             capture.recorder.set_enabled(self.recording_enabled)
+        self.thumbnail_streams = self.captures
+        self.thumbnail_images: list[tk.PhotoImage | None] = [None] * len(cameras)
+        self.thumbnail_items: dict[int, int] = {}
         self.closed = False
 
         root.title("Mouse arena — spatial motion dispatcher")
@@ -448,11 +487,18 @@ class SpatialLayout:
         self.sentinel_label.bind("<Button-1>", self._corner_press)
         self.sentinel_label.bind("<B1-Motion>", self._corner_drag)
         self.sentinel_label.bind("<ButtonRelease-1>", self._corner_release)
+        self.timestamp_session = TimestampSession(
+            [(f"camera-{i+1:02d}", c) for i, c in enumerate(cameras)] +
+            [("sentinel", sentinel)], event_dir)
+        for capture in self.captures:
+            capture.recorder.timing_manifest = str(self.timestamp_session.manifest.resolve())
+        self.timestamp_session.start()
+        self.last_thumbnail_update = 0.0
         self.sentinel_stream.start()
         for capture in self.captures:
             capture.start()
         self._draw()
-        root.after(40, self._refresh)
+        root.after(1, self._refresh)
 
     def _read_config(self) -> dict[str, Any]:
         try:
@@ -567,7 +613,7 @@ class SpatialLayout:
             # End cameras only contribute through the nearest half of the
             # 70 cm cage. Convert axial depth to ray length for drawing.
             length_cm = ((CAGE_WIDTH_CM / 2) / math.cos(half)
-                         if is_end_camera else 62)
+                         if is_end_camera else CAGE_HEIGHT_CM / math.cos(half))
             ox, oy = self._to_canvas(x, y)
             cone = [(x, y)]
             for ray in (direction - half, direction + half):
@@ -599,6 +645,28 @@ class SpatialLayout:
             self.canvas.create_text(ox, oy, text=str(index + 1), fill="white",
                                     font=("TkDefaultFont", 11, "bold"),
                                     tags=("camera", f"cam{index}"))
+        self.thumbnail_items.clear()
+        for index, camera in enumerate(self.cameras):
+            x, y = self.positions[camera.bus]
+            x, y, angle = snap_to_cage(x, y)
+            ox, oy = self._to_canvas(x, y)
+            if angle == 90:
+                tx, ty = ox - 72, oy + 25
+            elif angle == -90:
+                tx, ty = ox - 72, oy - 106
+            elif angle == 0:
+                tx, ty = ox + 25, oy - 40
+            else:
+                tx, ty = ox - 169, oy - 40
+            self.canvas.create_rectangle(tx - 1, ty - 1, tx + 145, ty + 82,
+                                         fill="#111", outline="#86d7ff")
+            image = self.thumbnail_images[index]
+            if image is None:
+                self.canvas.create_text(tx + 72, ty + 40, text="Preview loading…",
+                                        fill="#aaa")
+            else:
+                self.thumbnail_items[index] = self.canvas.create_image(
+                    tx, ty, anchor="nw", image=image)
         if self.test_point:
             self.status.configure(text="Dispatcher selection: " +
                                   (", ".join(f"Camera {n + 1}" for n in sorted(active))
@@ -696,18 +764,26 @@ class SpatialLayout:
             self._save()
 
     def _coverage(self, points: list[tuple[float, float]]) -> set[int]:
+        """Route events by wall: long sides always, ends only their arena half.
+
+        A box crossing the midpoint selects both ends. Routing is independent
+        of the illustrative optical FoV so edge activity is not discarded.
+        """
+        if not points:
+            return set()
         active: set[int] = set()
         for index, camera in enumerate(self.cameras):
             x, y = self.positions[camera.bus]
             x, y, angle = snap_to_cage(x, y)
-            max_depth = (CAGE_WIDTH_CM / 2
-                         if x == 0.0 or x == CAGE_WIDTH_CM else None)
-            if any(point_in_fov(x, y, angle, px, py,
-                                max_depth=max_depth) for px, py in points):
+            if angle in (90.0, -90.0):
+                active.add(index)
+            elif angle == 0.0 and any(px <= CAGE_WIDTH_CM / 2 for px, _ in points):
+                active.add(index)
+            elif angle == 180.0 and any(px >= CAGE_WIDTH_CM / 2 for px, _ in points):
                 active.add(index)
         return active
 
-    def _process_motion(self, frame: bytes) -> bytes:
+    def _process_motion(self, frame: bytes) -> bytes | None:
         self.motion_detector.configure(self.threshold_value.get(),
                                        self.percent_value.get())
         changed = self.motion_detector.changed_percent(frame)
@@ -757,11 +833,20 @@ class SpatialLayout:
                 (x, y + height / 2), (x + width, y + height / 2),
             ])
         self.test_point = points[0] if points else None
-        self.active_cameras = self._coverage(points) if points else set()
+        self.active_cameras = self._coverage(points)
         available = {index for index in self.active_cameras
                      if self.captures[index].online}
         recording = (self.recording_enabled and bool(boxes)
-                     and len(available) >= 3)
+                     and bool(available))
+        self.cv_count += 1
+        elapsed = now_monotonic - self.cv_started
+        if elapsed >= 1:
+            self.cv_fps = self.cv_count / elapsed
+            self.cv_count = 0
+            self.cv_started = now_monotonic
+        if now_monotonic - self.last_render < 0.1:
+            return None
+        self.last_render = now_monotonic
         now = time.time()
         for index, capture in enumerate(self.captures):
             capture.update(recording and index in available, now)
@@ -769,9 +854,11 @@ class SpatialLayout:
         offline = [str(index + 1) for index, capture in enumerate(self.captures)
                    if not capture.online]
         self.dispatch_status.configure(
-            text=(f"Changed: {changed:.2f}%   Motion: "
+            text=(f"Sentinel: {self.sentinel_stream.measured_fps:.1f} FPS | CV: {self.cv_fps:.1f} FPS\n"
+                  f"Changed: {changed:.2f}%   Motion: "
                   f"{min(self.motion_frames, required)}/{required} frames\n"
-                  f"FoV cameras: {selected or 'none'}\n"
+                  f"Triggered cameras: {selected or 'none'}\n"
+                  f"Timestamps: {'ERROR' if self.timestamp_session.errors else 'saving'}\n"
                   f"Recording: {'DISABLED' if not self.recording_enabled else 'YES' if recording else 'armed'}"
                   f"{'   Offline: ' + ', '.join(offline) if offline else ''}"),
             fg="#ff7676" if recording else "#ddd")
@@ -802,6 +889,26 @@ class SpatialLayout:
                              format="PPM")
 
     def _refresh(self) -> None:
+        now = time.monotonic()
+        recording = any(c.recorder.recording for c in self.captures)
+        preview_due = now - self.last_thumbnail_update >= (0.5 if recording else 0.1)
+        if preview_due:
+            self.last_thumbnail_update = now
+        for index, stream in enumerate(self.thumbnail_streams):
+            if not preview_due:
+                break
+            try:
+                frame = stream.frames.get_nowait()
+            except queue.Empty:
+                continue
+            if self.camera_flips[self.cameras[index].bus]:
+                frame = self.motion_detector.np.frombuffer(
+                    frame, dtype=self.motion_detector.np.uint8
+                ).reshape(81, 144, 3)[::-1, ::-1].tobytes()
+            self.thumbnail_images[index] = self._photo(frame, 144, 81)
+            item = self.thumbnail_items.get(index)
+            if item is not None:
+                self.canvas.itemconfigure(item, image=self.thumbnail_images[index])
         try:
             frame = self.sentinel_stream.frames.get_nowait()
             if self.sentinel_flipped:
@@ -809,8 +916,9 @@ class SpatialLayout:
                     frame, dtype=self.motion_detector.np.uint8
                 ).reshape(270, 480, 3)[::-1, ::-1].tobytes()
             frame = self._process_motion(frame)
-            self.sentinel_image = self._photo(frame, 480, 270)
-            if self.selected is None:
+            if frame is not None:
+                self.sentinel_image = self._photo(frame, 480, 270)
+            if frame is not None and self.selected is None:
                 self.sentinel_label.configure(image=self.sentinel_image, text="")
         except queue.Empty:
             pass
@@ -827,7 +935,7 @@ class SpatialLayout:
             except queue.Empty:
                 pass
         if not self.closed:
-            self.root.after(40, self._refresh)
+            self.root.after(1, self._refresh)
 
     def close(self) -> None:
         if self.closed:
@@ -851,25 +959,25 @@ class SpatialLayout:
             worker.start()
         for worker in workers:
             worker.join()
+        self.timestamp_session.close()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--layout-file", default="camera_layout.json")
+    parser.add_argument("--layout-file", default=str(Path(__file__).with_name("camera_layout_five.json")))
     parser.add_argument("--event-dir", default="/mnt/ssd/camera-events")
-    parser.add_argument("--buffer-dir", default="/dev/shm/camera-grid")
+    parser.add_argument("--buffer-dir", default="/dev/shm/mouse-five")
     parser.add_argument("--pre-seconds", type=float, default=5)
     parser.add_argument("--post-seconds", type=float, default=10)
     args = parser.parse_args()
-    cameras, rejected = discover()
-    sentinels = [camera for camera in rejected
-                 if "MJPG" in camera.formats and "Arducam" not in camera.name]
-    if len(cameras) != 10 or not sentinels:
-        raise SystemExit(f"Expected 10 H.264 perimeter cameras and one MJPEG "
-                         f"sentinel; found {len(cameras)} and {len(sentinels)}")
-    sentinel = sentinels[-1]
-    sentinel = Camera(stable_index0(sentinel.device), sentinel.name,
-                      sentinel.bus, sentinel.formats)
+    supported, rejected = discover()
+    devices = supported + rejected
+    sentinels = [c for c in devices if "Global Shutter" in c.name and "MJPG" in c.formats]
+    cameras = [c for c in devices if "HD USB Camera" in c.name and "MJPG" in c.formats]
+    if len(cameras) != 4 or len(sentinels) != 1:
+        raise SystemExit(f"Expected four HD USB side cameras and one Global Shutter Sentinel; found {len(cameras)} and {len(sentinels)}")
+    cameras = [Camera(stable_index0(c.device), c.name, c.bus, c.formats) for c in cameras]
+    sentinel = sentinels[0]
     root = tk.Tk()
     viewer = SpatialLayout(root, cameras, sentinel, Path(args.layout_file),
                            Path(args.event_dir), Path(args.buffer_dir),

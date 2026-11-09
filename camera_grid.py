@@ -7,6 +7,7 @@ import argparse
 from collections import deque
 from datetime import datetime
 import glob
+import json
 import os
 from pathlib import Path
 import queue
@@ -255,13 +256,14 @@ class EventRecorder:
     """Retain rolling H.264 segments around motion and join them losslessly."""
 
     def __init__(self, root: Path, buffer_root: Path, camera_number: int,
-                 pre_seconds: float, post_seconds: float):
+                 pre_seconds: float, post_seconds: float, extension: str = "ts"):
+        self.extension = extension
         self.root = root
         self.camera_number = camera_number
         self.pre_seconds, self.post_seconds = pre_seconds, post_seconds
         self.rolling = buffer_root / f"camera-{camera_number:02d}"
         self.rolling.mkdir(parents=True, exist_ok=True)
-        for stale in self.rolling.glob("*.ts"):
+        for stale in self.rolling.glob(f"*.{self.extension}"):
             stale.unlink(missing_ok=True)
         self.event_dir: Path | None = None
         self.event_segments: list[Path] = []
@@ -271,7 +273,7 @@ class EventRecorder:
 
     @property
     def segment_pattern(self) -> str:
-        return str(self.rolling / "%Y%m%d-%H%M%S.ts")
+        return str(self.rolling / f"%Y%m%d-%H%M%S.{self.extension}")
 
     @property
     def recording(self) -> bool:
@@ -287,7 +289,7 @@ class EventRecorder:
         if motion:
             self.last_motion = now
             if self.event_dir is None:
-                stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+                stamp = datetime.fromtimestamp(now).strftime("%Y%m%d-%H%M%S-%f")[:-3]
                 self.event_dir = self.root / f"camera-{self.camera_number:02d}" / stamp
                 self.event_dir.mkdir(parents=True, exist_ok=True)
         self._collect_completed(now)
@@ -301,7 +303,7 @@ class EventRecorder:
 
     def _completed(self, now: float) -> list[Path]:
         # Leave FFmpeg's newest segment alone while it may still be open.
-        return sorted(path for path in self.rolling.glob("*.ts")
+        return sorted(path for path in self.rolling.glob(f"*.{self.extension}")
                       if path.stat().st_size > 0
                       and now - path.stat().st_mtime >= 1.5)
 
@@ -341,20 +343,50 @@ class EventRecorder:
             thread.join(timeout=10)
 
     def _join(self, event_dir: Path, segments: list[Path]) -> None:
-        output = event_dir.with_suffix(".ts")
-        partial = output.with_suffix(".partial.ts")
+        output = event_dir.with_suffix(f".{self.extension}")
+        partial = output.with_suffix(f".partial.{self.extension}")
         manifest = event_dir / "segments.txt"
         ordered = sorted(segments)
-        manifest.write_text("".join(f"file '{segment.name}'\n" for segment in ordered))
+        entries = [f"file '{segment.name}'\n" for segment in ordered]
+        if self.extension == "mkv":
+            # Spatial captures retain absolute kernel-derived timestamps. Preserve
+            # inter-segment timing and expose the shared epoch for multi-view sync.
+            starts = []
+            for segment in ordered:
+                probe = subprocess.run([
+                    "nice", "-n", "10", "ffprobe", "-v", "error", "-threads", "1", "-select_streams", "v:0",
+                    "-read_intervals", "%+#1", "-show_entries", "packet=pts_time",
+                    "-of", "json", str(segment),
+                ], capture_output=True, text=True)
+                try:
+                    starts.append(float(json.loads(probe.stdout)["packets"][0]["pts_time"]))
+                except (ValueError, KeyError, IndexError):
+                    return  # Keep source segments if their timeline cannot be read.
+            for i in range(len(entries) - 1):
+                entries[i] += f"duration {starts[i + 1] - starts[i]:.6f}\n"
+            output.with_suffix(".timestamps.json").write_text(json.dumps({
+                "camera_number": self.camera_number,
+                "timestamp_source": "V4L2 kernel timestamps converted to host wall clock",
+                "first_frame_unix_seconds": starts[0],
+                "mapping": "frame Unix time = first_frame_unix_seconds + video packet PTS seconds",
+                "precision_seconds": 0.001,
+                "hardware_synchronized": False,
+                "uvc_timing_manifest": getattr(self, "timing_manifest", None),
+            }, indent=2))
+        manifest.write_text("".join(entries))
         result = subprocess.run([
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-f", "concat", "-safe", "0", "-i", str(manifest),
+            "nice", "-n", "10", "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-threads", "1", "-f", "concat", "-safe", "0", "-i", str(manifest),
             "-map", "0:v:0", "-c:v", "copy", str(partial),
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         if result.returncode == 0 and partial.stat().st_size > 0:
             partial.replace(output)
         else:
             partial.unlink(missing_ok=True)
+            if self.extension != "ts":
+                # Matroska files cannot be recovered by byte concatenation.
+                # Preserve the original segments and manifest for recovery.
+                return
             # Keep an event recoverable even if remuxing an interrupted segment fails.
             with output.open("wb") as destination:
                 for segment in ordered:
@@ -436,7 +468,7 @@ class Stream:
                 # remain the camera's untouched 1080p H.264 bitstream.
                 "-lowres", "1", "-skip_idct", "noref",
                 "-skip_loop_filter", "all", "-threads", "1",
-                "-f", "v4l2", "-input_format", "h264", "-framerate", str(self.fps),
+                "-f", "v4l2", "-input_format", ("h264" if self.camera.h264 else "mjpeg"), "-framerate", str(self.fps),
                 "-video_size", self.capture_size,
                 "-i", self.camera.device, "-an",
             ]
@@ -711,6 +743,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="probe devices and exit")
     parser.add_argument("--devices", nargs="*", help="explicit /dev/video devices (skip discovery)")
+    parser.add_argument("--input-format", choices=("h264", "mjpeg"), default="h264",
+                        help="capture format for explicitly supplied devices")
     parser.add_argument("--columns", type=int, default=5)
     parser.add_argument("--width", type=int, default=352, help="decoded tile width")
     parser.add_argument("--height", type=int, default=198, help="decoded tile height")
@@ -757,7 +791,8 @@ def main() -> int:
             or args.min_motion_cameras < 1 or args.motion_window <= 0):
         parser.error("columns, dimensions, and fps must be positive")
     if args.devices is not None:
-        cameras = [Camera(d, os.path.basename(d), "explicit", ("H264",)) for d in args.devices]
+        fourcc = "H264" if args.input_format == "h264" else "MJPG"
+        cameras = [Camera(d, os.path.basename(d), "explicit", (fourcc,)) for d in args.devices]
         rejected: list[Camera] = []
     else:
         cameras, rejected = discover()

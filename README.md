@@ -1,3 +1,58 @@
+# Five-camera spatial layout
+
+Run `python3 spatial_layout.py` for four HD USB side cameras and one Global
+Shutter overhead Sentinel. Side capture uses 1920×1080 MJPEG at 30 FPS; the
+Sentinel uses 1920×1200 MJPEG at 60 FPS. OpenCV analyzes 480×270 frames at the
+incoming rate, while the UI redraws at 10 FPS. The status shows capture and CV
+rates separately. Live testing achieved approximately 59.7 CV FPS.
+
+Sustained motion within the calibrated overhead area triggers both long-side
+cameras for every event. Each end camera records only motion in its half of the
+arena; boxes crossing the midpoint select both ends. Optical FoV cones show
+140° HFOV, independently of event routing. Side streams retain five
+seconds of pre-trigger footage and ten seconds after motion in losslessly copied
+MJPEG Matroska files under `/mnt/ssd/camera-events`. Click a side camera for a
+buffered identification preview; Sentinel analysis continues. Drag cameras to
+their wall positions and adjust the cyan corners to the cage floor. Initial
+corners are an estimate for the new overhead view. Settings are saved separately
+in `camera_layout_five.json`, preserving the previous layout.
+
+Side thumbnails are decoded directly by the existing capture processes at 10 FPS,
+using reduced-resolution JPEG decoding. Full-resolution recording is stream-copy;
+preview frames never replace recorded frames. Recording disk work runs outside
+the Sentinel CV/UI loop.
+
+Each new spatial recording has a `.timestamps.json` sidecar. To align views,
+add `first_frame_unix_seconds` to each packet PTS in the associated MKV. Capture
+uses kernel-derived timestamps converted to the host wall clock; segment joining
+preserves inter-segment offsets. Timestamp storage resolution is 1 ms, not a claim
+of exposure accuracy. Cameras free-run at about 29.8 FPS: compare nearest timestamps
+rather than matching frame numbers. Simultaneous sensor exposures require hardware
+synchronization; no such synchronization is enabled here. Older recordings lack
+this mapping. Keep each sidecar with its video.
+
+Raw device and receive timestamps are saved for all five cameras throughout each
+app session under `/mnt/ssd/camera-events/timing/<session>/`. Each `.uvch.gz` file
+contains original Linux UVC payload headers: host receive monotonic nanoseconds,
+host USB SOF, raw device PTS, device SCR and device USB SOF (when supplied).
+`session.json` identifies cameras and endpoints and reports collection errors,
+record counts and any incomplete tail discarded on shutdown. `clock.jsonl`
+samples host realtime between two monotonic readings once per second, allowing
+conversion to the video sidecars' wall-clock timeline without assuming a fixed
+wall-clock offset. Event `.timestamps.json` files link to their timing manifest.
+These are session logs, including periods when recording is OFF; keep the linked
+timing directory with retained clips. Shutdown closes the compressed logs.
+
+Decode a completed log with `python3 uvc_timestamps.py <file.uvch.gz>` to JSON
+lines. Headers are per USB payload, so many rows can share one frame PTS. Raw
+32-bit camera counters can wrap and must be calibrated per device; they are not
+UTC values or proof of synchronized exposures. Logs preserve headers delivered
+by Linux; they do not assert that the driver supplied every USB payload header.
+Thumbnails redraw at 2 FPS while recording, with full-rate capture and Sentinel
+motion analysis maintained independently.
+
+The following documents the original ten-camera viewer configuration.
+
 # Ten-camera H.264 viewer
 
 A lightweight Linux viewer for ten USB/UVC cameras. It discovers Video4Linux
